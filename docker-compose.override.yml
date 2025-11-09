@@ -1,0 +1,7 @@
+services:
+  app1:
+    ports:
+      - "8001:8000"
+  app2:
+    ports:
+      - "8002:8000"
