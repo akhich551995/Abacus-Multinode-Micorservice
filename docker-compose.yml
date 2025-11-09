@@ -1,9 +1,28 @@
 services:
-  app:
+  app1:
     build: .
-    ports:
-      - "8000:8000"
     environment:
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_MAX_OPERATION_ATTEMPTS=3
+      - REDIS_BACKOFF_BASE_SECONDS=0.05
+      - REDIS_BACKOFF_CAP_SECONDS=0.5
+      - REDIS_HEALTH_CHECK_INTERVAL=30
+      - ABACUS_AUTH_ENABLED=true
+      - ABACUS_API_KEYS=local-dev-key
+      - ABACUS_RATE_LIMIT_ENABLED=true
+      - ABACUS_RATE_LIMIT_REQUESTS=60
+      - ABACUS_RATE_LIMIT_WINDOW_SECONDS=60
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app2:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379/0
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_MAX_OPERATION_ATTEMPTS=3
