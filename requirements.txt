@@ -5,3 +5,5 @@ prometheus-client
 Docker
 pytest
 fakeredis
+testcontainers
+requests
