@@ -199,17 +199,21 @@ async def add_number(
 ):
     """Adds the provided number to the running sum stored in Redis."""
     payload_dict = data.model_dump()
+    # Idempotency is optional. If the client supplies an Idempotency-Key header
+    # we will attempt to ensure the request is processed only once and return
+    # the same response for retries. If no header is provided we still compute
+    # a deterministic cache key based on the request payload so retries with the
+    # same body are idempotent.
     raw_header = request.headers.get(IDEMPOTENCY_KEY_HEADER)
     header_value = raw_header.strip() if isinstance(raw_header, str) else ""
-    if not header_value:
-        raise HTTPException(status_code=400, detail="Idempotency-Key header is required.")
-    if len(header_value) > 200:
+    if header_value and len(header_value) > 200:
         raise HTTPException(status_code=400, detail="Idempotency key is too long.")
 
     key_info = _normalize_idempotency_key(request, payload_dict)
     cache_key = key_info["cache_key"]
     header_digest = key_info["header_digest"]
 
+    # Fast-path: if a cached entry already exists return it
     cached_payload_raw = redis_get(cache_key)
     if isinstance(cached_payload_raw, (bytes, str)) and cached_payload_raw:
         try:
@@ -237,6 +241,37 @@ async def add_number(
             if cached_response is not None:
                 return cached_response
 
+    # Reservation key prevents multiple processes from performing the same
+    # operation concurrently. We use SET NX with an expiry.
+    reservation_key = f"{cache_key}:lock"
+    try:
+        reserved = redis_set(reservation_key, "1", nx=True, ex=IDEMPOTENCY_TTL_SECONDS)
+    except redis.RedisError as err:
+        logger.warning("Failed to acquire idempotency reservation for %s: %s", cache_key, err)
+        reserved = False
+
+    if not reserved:
+        # Another worker may be processing the same request. Try to read the
+        # cached response a few times before giving up.
+        for _ in range(5):
+            cached_payload_raw = redis_get(cache_key)
+            if isinstance(cached_payload_raw, (bytes, str)) and cached_payload_raw:
+                try:
+                    cached_payload = (
+                        cached_payload_raw.decode("utf-8") if isinstance(cached_payload_raw, bytes) else cached_payload_raw
+                    )
+                    cached_entry = json.loads(cached_payload)
+                    cached_response = cached_entry.get("response")
+                    if cached_response is not None:
+                        return cached_response
+                except json.JSONDecodeError:
+                    redis_delete(cache_key)
+                    break
+            time.sleep(0.1)
+        # If we reach here there is a reservation but no cached response yet.
+        # Return a conflict to indicate the request is already in-flight.
+        raise HTTPException(status_code=409, detail="Idempotency key conflict: request already in progress.")
+
     try:
         new_sum = increment_sum(data.number)
     except RedisOverflowError as err:
@@ -257,7 +292,6 @@ async def add_number(
             "abacus.sum.change",
             extra={"event": "abacus.sum.change", "key": SUM_KEY, "delta": data.number, "new_sum": new_sum},
         )
-
         cache_entry = json.dumps(
             {
                 "request": payload_dict,
@@ -270,21 +304,33 @@ async def add_number(
             stored = redis_set(cache_key, cache_entry, nx=True, ex=IDEMPOTENCY_TTL_SECONDS)
         except redis.RedisError as err:
             logger.error("Failed to store idempotency cache %s: %s", cache_key, err)
-        else:
-            if not stored:
-                cached_payload_raw = redis_get(cache_key)
-                if isinstance(cached_payload_raw, (bytes, str)) and cached_payload_raw:
+            stored = False
+
+        # Release reservation (best-effort). The reservation key has TTL so this
+        # is only to speed up other waiters.
+        try:
+            redis_delete(reservation_key)
+        except Exception:
+            pass
+
+        if not stored:
+            # Another worker stored the cache; return that stored response.
+            cached_payload_raw = redis_get(cache_key)
+            if isinstance(cached_payload_raw, (bytes, str)) and cached_payload_raw:
+                try:
+                    cached_payload = (
+                        cached_payload_raw.decode("utf-8") if isinstance(cached_payload_raw, bytes) else cached_payload_raw
+                    )
+                    cached_entry = json.loads(cached_payload)
+                    cached_response = cached_entry.get("response")
+                    if cached_response is not None:
+                        return cached_response
+                except json.JSONDecodeError:
+                    logger.warning("Failed to decode existing idempotency entry for key %s; overwriting.", cache_key)
                     try:
-                        cached_payload = (
-                            cached_payload_raw.decode("utf-8") if isinstance(cached_payload_raw, bytes) else cached_payload_raw
-                        )
-                        cached_entry = json.loads(cached_payload)
-                        cached_response = cached_entry.get("response")
-                        if cached_response is not None:
-                            return cached_response
-                    except json.JSONDecodeError:
-                        logger.warning("Failed to decode existing idempotency entry for key %s; overwriting.", cache_key)
                         redis_set(cache_key, cache_entry, ex=IDEMPOTENCY_TTL_SECONDS)
+                    except Exception:
+                        pass
 
         return response_payload
 
