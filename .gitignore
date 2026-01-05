@@ -1,0 +1,5 @@
+__pycache__
+.csv
+.ipynb_checkpoints
+results.csv
+metrics_snapshots.txt
