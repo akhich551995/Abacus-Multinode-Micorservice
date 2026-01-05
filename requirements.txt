@@ -1,3 +1,4 @@
+# projct dependencies
 fastapi
 uvicorn[standard]
 redis
